@@ -1,0 +1,5 @@
+LIBRARY EXR
+EXPORTS
+    GetPlugInInfo
+    ReadEXR
+    ReadEXR_W

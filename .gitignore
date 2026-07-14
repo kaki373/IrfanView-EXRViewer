@@ -1,0 +1,17 @@
+# Build artifacts
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.o
+
+# Keep the shipped plugin (dist/EXR.dll) tracked; ignore stray build copies elsewhere
+/EXR.dll
+/src/EXR.dll
+
+# Editor / OS
+.vs/
+*.user
+Thumbs.db
+desktop.ini

@@ -1,19 +1,26 @@
 # Third-party notices
 
-This project vendors the following single-header libraries. They are compiled
-into `EXR.dll`; each remains under its own license.
+`EXR.dll` statically links the following libraries. They are not vendored in
+this repository (see [../BUILD.md](../BUILD.md) for how to obtain/build them);
+each remains under its own license.
 
-## tinyexr (`tinyexr.h`, `exr_reader.hh`, `streamreader.hh`)
-- Source: https://github.com/syoyo/tinyexr
+## OpenEXR
+- Source: https://github.com/AcademySoftwareFoundation/openexr
 - License: BSD 3-Clause
-- Used for parsing and decoding OpenEXR files from memory.
+- Provides all EXR decoding (scanline/tiled, ZIP/PIZ/RLE/PXR24/B44/DWAA/DWAB,
+  single- and multi-part).
 
-## stb (`stb_image.h`, `stb_image_write.h`)
-- Source: https://github.com/nothings/stb
-- License: Public Domain (or MIT, at your option)
-- `stb_image.h` provides the zlib inflate used by tinyexr's decode path
-  (`TINYEXR_USE_STB_ZLIB`). `stb_image_write.h` is included only to satisfy a
-  linker reference from tinyexr's (unused) save path.
+## Imath
+- Source: https://github.com/AcademySoftwareFoundation/Imath
+- License: BSD 3-Clause
+- Math types used by OpenEXR (half, boxes, etc.).
 
-Refer to each upstream repository for the full license text. This project's own
-code is under the MIT License (see ../LICENSE).
+## libdeflate
+- Source: https://github.com/ebiggers/libdeflate
+- License: MIT
+- Vendored inside OpenEXR 3.x for ZIP (de)compression.
+
+The 8x8 bitmap font used for the on-image caption is `font8x8_basic` (public
+domain, by Daniel Hepper), embedded directly in `src/exrplugin.cpp`.
+
+This project's own code is under the MIT License (see ../LICENSE).

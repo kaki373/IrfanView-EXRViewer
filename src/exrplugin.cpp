@@ -3,14 +3,16 @@
 // lets the user switch layers in-place inside IrfanView via a global hotkey
 // (Ctrl+Alt+Right / Ctrl+Alt+Left).
 //
+// Decoder: real OpenEXR (static libs), fed from in-memory file bytes through a
+// custom Imf::IStream (Unicode-safe, no fopen). Metadata (layers) is parsed up
+// front; pixels are decoded LAZILY, one layer at a time, and tone-mapped to a
+// cached bottom-up BGRX buffer. Handles DWAA/DWAB, tiled, and multipart EXRs
+// and exposes every part's layers for switching.
+//
 // Exports (undecorated, see exrplugin.def):
 //   int   GetPlugInInfo(char* version, char* formats)
 //   void* ReadEXR   (const char*    filename, void*, void*, wchar_t*, wchar_t*, int*, int*)
 //   void* ReadEXR_W (const wchar_t* filename, void*, void*, wchar_t*, wchar_t*, int*, int*)
-//
-// Decode/tonemap logic is ported from exrlayers.cpp with the required fixes
-// (UINT channels, Unicode-safe *FromMemory loading, non-finite depth -> black,
-// size_t pixel arithmetic).
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -46,23 +48,21 @@ typedef struct _DROPFILES_LOCAL {
 #include <vector>
 #include <map>
 #include <memory>
+#include <thread>
 #include <algorithm>
 #include <cctype>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
-#define TINYEXR_IMPLEMENTATION
-#define TINYEXR_USE_MINIZ 0
-#define TINYEXR_USE_STB_ZLIB 1
-#include "tinyexr.h"
-
-// tinyexr's implementation references stbi_zlib_compress (used only on its
-// save/compress path, which we never call) when TINYEXR_USE_STB_ZLIB=1. That
-// symbol is provided by stb_image_write.h's implementation, so include it to
-// satisfy the linker even though the DLL does not write images.
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+// ---- OpenEXR (static) ----
+#include <ImfMultiPartInputFile.h>
+#include <ImfInputPart.h>
+#include <ImfChannelList.h>
+#include <ImfFrameBuffer.h>
+#include <ImfHeader.h>
+#include <ImfPixelType.h>
+#include <ImfIO.h>
+#include <ImfThreading.h>
+#include <ImathBox.h>
+#include <Iex.h>
 
 // ---------------------------------------------------------------------------
 // 8x8 bitmap font (public domain "font8x8_basic", dhepper) for ASCII 0x20-0x7F.
@@ -168,7 +168,7 @@ static const unsigned char kFont8x8[96][8] = {
 };
 
 // ---------------------------------------------------------------------------
-// Small helpers (ported from exrlayers.cpp)
+// Small helpers
 // ---------------------------------------------------------------------------
 
 static std::string ToLowerAscii(const std::string &s) {
@@ -201,45 +201,44 @@ static unsigned char To8(float v01) {
   return (unsigned char)iv;
 }
 
-// Linear-interpolation percentile (numpy-style) over a pre-sorted ascending vector.
-static float PercentileSorted(const std::vector<float> &sorted, double p) {
-  if (sorted.empty()) return 0.0f;
-  double pos = (p / 100.0) * (double)(sorted.size() - 1);
+// Linear-interpolation percentile (numpy-style) computed with std::nth_element
+// instead of a full sort. Reorders `v` in place. Same result as sorting.
+static float PercentileNth(std::vector<float> &v, double p) {
+  size_t n = v.size();
+  if (n == 0) return 0.0f;
+  double pos = (p / 100.0) * (double)(n - 1);
   size_t lo = (size_t)std::floor(pos);
   size_t hi = (size_t)std::ceil(pos);
-  if (hi >= sorted.size()) hi = sorted.size() - 1;
+  if (hi >= n) hi = n - 1;
   double frac = pos - (double)lo;
-  return (float)(sorted[lo] + (sorted[hi] - sorted[lo]) * frac);
+
+  std::nth_element(v.begin(), v.begin() + lo, v.end());
+  float vlo = v[lo];
+  float vhi = vlo;
+  if (hi != lo)  // element at sorted-position lo+1 = min of the upper partition
+    vhi = *std::min_element(v.begin() + (lo + 1), v.end());
+  return (float)(vlo + (vhi - vlo) * frac);
 }
 
-// ---------------------------------------------------------------------------
-// Layer model
-// ---------------------------------------------------------------------------
+// Precomputed linear -> sRGB 8-bit lookup table (built once in OneTimeInit).
+// 13-bit index resolution; banding is invisible at 8-bit output.
+static const int kSrgbLutSize = 8192;
+static unsigned char g_srgbLut[kSrgbLutSize];
 
-struct Layer {
-  std::string name;                            // "" for top-level beauty
-  std::map<std::string, const float *> comps;  // comp name -> pixel data
-};
-
-static bool IsColorLayer(const Layer &layer) {
-  return layer.comps.count("R") || layer.comps.count("G") || layer.comps.count("B");
-}
-
-static bool IsDepthLikeOrdering(const std::string &name, const Layer &layer) {
-  std::string lower = ToLowerAscii(name);
-  if (lower.find("depth") != std::string::npos ||
-      lower.find("position") != std::string::npos ||
-      lower.find("normal") != std::string::npos) {
-    return true;
+static void BuildSrgbLut() {
+  for (int i = 0; i < kSrgbLutSize; i++) {
+    float x = (float)i / (float)(kSrgbLutSize - 1);
+    g_srgbLut[i] = To8(SrgbEncode(x));
   }
-  if (layer.comps.size() == 1 && layer.comps.begin()->first == "Z") return true;
-  return false;
 }
 
-static bool IsDepthLikeTonemap(const std::string &layerName, const std::string &compName) {
-  if (ToLowerAscii(layerName).find("depth") != std::string::npos) return true;
-  if (compName == "Z") return true;
-  return false;
+static inline unsigned char SrgbLut8(float x) {
+  if (x <= 0.0f) return g_srgbLut[0];
+  if (x >= 1.0f) return g_srgbLut[kSrgbLutSize - 1];
+  int idx = (int)(x * (float)(kSrgbLutSize - 1) + 0.5f);  // round, not truncate
+  if (idx < 0) idx = 0;
+  if (idx >= kSrgbLutSize) idx = kSrgbLutSize - 1;
+  return g_srgbLut[idx];
 }
 
 static void SortCaseInsensitive(std::vector<std::string> &v) {
@@ -248,22 +247,70 @@ static void SortCaseInsensitive(std::vector<std::string> &v) {
   });
 }
 
-// Display name for a raw layer name: "" (top-level beauty) shows as "beauty".
-static std::string DisplayName(const std::string &raw) {
-  return raw.empty() ? std::string("beauty") : raw;
+// A layer's channels: component name -> full channel name (e.g. "R" -> "R",
+// "red" -> "VRaySamplerInfo_World.red").
+typedef std::map<std::string, std::string> CompMap;
+
+// Find the full channel name for a role, matching component names case-
+// insensitively against the given candidates. Returns "" if none present.
+static std::string FindRole(const CompMap &comps, const char *a, const char *b) {
+  for (const auto &kv : comps) {
+    std::string lc = ToLowerAscii(kv.first);
+    if (lc == a || (b && lc == b)) return kv.second;
+  }
+  return std::string();
+}
+
+// Color layer if it has any of R/G/B or red/green/blue (case-insensitive).
+static bool IsColorComps(const CompMap &comps) {
+  return !FindRole(comps, "r", "red").empty() ||
+         !FindRole(comps, "g", "green").empty() ||
+         !FindRole(comps, "b", "blue").empty();
+}
+
+// Ordering-time depth-like test: name matches depth|position|normal, OR the
+// layer's only component is "Z".
+static bool IsDepthLikeOrdering(const std::string &name, const CompMap &comps) {
+  std::string lower = ToLowerAscii(name);
+  if (lower.find("depth") != std::string::npos ||
+      lower.find("position") != std::string::npos ||
+      lower.find("normal") != std::string::npos) {
+    return true;
+  }
+  if (comps.size() == 1 && comps.begin()->first == "Z") return true;
+  return false;
+}
+
+// Tone-mapping-time depth-like test: layer name contains "depth", or the scalar
+// component is exactly "Z".
+static bool IsDepthLikeTonemap(const std::string &layerName, const std::string &compName) {
+  if (ToLowerAscii(layerName).find("depth") != std::string::npos) return true;
+  if (compName == "Z") return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
-// Decoded-file cache
+// Lazy-decode cache model
 // ---------------------------------------------------------------------------
+
+struct LayerDesc {
+  int part = 0;
+  int dispW = 0, dispH = 0;   // display window dims = the DIB / output size
+  int ox = 0, oy = 0;         // data-window origin within the display window
+  std::string display;        // ordered display name (part-prefixed if multipart)
+  bool isColor = false;
+  std::string rName, gName, bName;  // full channel names for color roles
+  std::string scalarName;           // full channel name for scalar layers
+  bool depthLike = false;           // scalar depth tonemap
+};
 
 struct DecodedFile {
   std::wstring path;
   uint64_t mtime = 0;
-  int width = 0;
-  int height = 0;
-  std::vector<std::string> names;                     // ordered layer names ("" = beauty)
-  std::vector<std::vector<unsigned char>> layerPix;   // per-layer bottom-up BGRX
+  std::vector<unsigned char> bytes;                    // whole file (for lazy decode)
+  std::vector<LayerDesc> layers;                       // ordered
+  std::vector<std::vector<unsigned char>> bgrx;        // per-layer tone-mapped BGRX (lazy)
+  std::vector<int> lru;                                // decoded indices, oldest..newest
 };
 
 // ---------------------------------------------------------------------------
@@ -275,19 +322,15 @@ static bool g_csInit = false;
 static int g_index = 0;
 static std::wstring g_path;
 static int g_count = 0;
-static std::vector<std::string> g_names;
-static std::string g_currentLayerName;  // sticky layer selection (display name)
-static std::shared_ptr<DecodedFile> g_cache;  // guarded by g_cs
+static std::vector<std::string> g_names;       // display names of current file
+static std::string g_currentLayerName;         // sticky selection (display name)
+static std::shared_ptr<DecodedFile> g_cache;   // single cache slot, guarded by g_cs
+static bool g_reloadPending = false;           // one hotkey reload in flight at a time
+static ULONGLONG g_reloadStamp = 0;            // tick of last posted reload (stall recovery)
 
 static HMODULE g_hSelf = nullptr;
 static LONG g_initOnce = 0;
 static HANDLE g_hookThread = nullptr;
-
-// Stock-plugin fallback (EXR_original_backup.dll) state, guarded by g_cs.
-typedef void *(*ReadEXRW_fn)(const wchar_t *, void *, void *, wchar_t *, wchar_t *, int *, int *);
-static bool g_backupTried = false;
-static HMODULE g_backupMod = nullptr;
-static ReadEXRW_fn g_backupReadW = nullptr;
 
 // RAII guard for tiny critical-section regions; guarantees LeaveCriticalSection
 // even if the protected code throws (so a throw can never leave g_cs held).
@@ -300,12 +343,17 @@ struct CsGuard {
 };
 
 static void EnsureCsInit() {
-  // Safe to call before DllMain has run in the unlikely event; DllMain also
-  // initializes it. Double init is avoided via g_csInit under a simple guard.
   if (!g_csInit) {
     InitializeCriticalSection(&g_cs);
     g_csInit = true;
   }
+}
+
+static int DecodeThreads() {
+  unsigned n = std::thread::hardware_concurrency();
+  if (n == 0) n = 4;
+  if (n > 8) n = 8;
+  return (int)n;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,46 +397,83 @@ static bool ReadWholeFileW(const std::wstring &path, std::vector<unsigned char> 
 }
 
 // ---------------------------------------------------------------------------
-// Tone-map a single layer into a bottom-up BGRX buffer (row 0 = bottom image row)
+// In-memory Imf::IStream over a cached byte buffer (Unicode-safe: no fopen).
 // ---------------------------------------------------------------------------
 
-static void TonemapLayerToBGRX(const Layer &layer, const std::string &layerName,
-                               int w, int h, std::vector<unsigned char> &buf) {
-  buf.assign((size_t)w * (size_t)h * 4u, 0);
+class MemIStream : public Imf::IStream {
+ public:
+  MemIStream(const char *name, const unsigned char *data, size_t size)
+      : Imf::IStream(name), data_(data), size_(size), pos_(0) {}
+
+  bool isMemoryMapped() const override { return true; }
+
+  char *readMemoryMapped(int n) override {
+    if (n < 0 || pos_ + (size_t)n > size_)
+      throw IEX_NAMESPACE::InputExc("Unexpected end of file (memory-mapped read).");
+    char *r = (char *)(data_ + pos_);
+    pos_ += (size_t)n;
+    return r;
+  }
+
+  bool read(char c[], int n) override {
+    if (n < 0 || pos_ + (size_t)n > size_)
+      throw IEX_NAMESPACE::InputExc("Unexpected end of file.");
+    std::memcpy(c, data_ + pos_, (size_t)n);
+    pos_ += (size_t)n;
+    return pos_ < size_;  // false when the last byte was read
+  }
+
+  uint64_t tellg() override { return (uint64_t)pos_; }
+  void seekg(uint64_t pos) override { pos_ = (size_t)pos; }
+  int64_t size() override { return (int64_t)size_; }
+
+ private:
+  const unsigned char *data_;
+  size_t size_;
+  size_t pos_;
+};
+
+// ---------------------------------------------------------------------------
+// Tone-map decoded float channels of a single layer into a bottom-up BGRX
+// buffer (buffer row 0 = bottom image row).
+// ---------------------------------------------------------------------------
+
+// Decode float channels of the DATA window (w x h) and composite them into a
+// DISPLAY-sized (dispW x dispH) bottom-up BGRX buffer at offset (ox,oy), with
+// black outside the data region. For the common case dispW==w, dispH==h,
+// ox==oy==0 this is byte-identical to filling a data-sized buffer.
+static void TonemapToBGRX(int w, int h, int dispW, int dispH, int ox, int oy, bool isColor,
+                          const float *rc, const float *gc, const float *bc,
+                          const float *scalar, bool depthLike,
+                          std::vector<unsigned char> &buf) {
+  buf.assign((size_t)dispW * (size_t)dispH * 4u, 0);  // zero => black margins
 
   auto putRGB = [&](int x, int y, unsigned char r, unsigned char g, unsigned char b) {
-    size_t bufRow = (size_t)(h - 1 - y);
-    size_t o = (bufRow * (size_t)w + (size_t)x) * 4u;
+    int X = x + ox, Y = y + oy;
+    if (X < 0 || X >= dispW || Y < 0 || Y >= dispH) return;  // clip to display window
+    size_t bufRow = (size_t)(dispH - 1 - Y);
+    size_t o = (bufRow * (size_t)dispW + (size_t)X) * 4u;
     buf[o + 0] = b;
     buf[o + 1] = g;
     buf[o + 2] = r;
     buf[o + 3] = 0xFF;
   };
 
-  if (IsColorLayer(layer)) {
-    auto find = [&](const char *k) -> const float * {
-      auto it = layer.comps.find(k);
-      return it == layer.comps.end() ? nullptr : it->second;
-    };
-    const float *rc = find("R");
-    const float *gc = find("G");
-    const float *bc = find("B");
+  if (isColor) {
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
         size_t idx = (size_t)y * (size_t)w + (size_t)x;
         float r = rc ? Clean(rc[idx]) : 0.0f;
         float g = gc ? Clean(gc[idx]) : 0.0f;
         float b = bc ? Clean(bc[idx]) : 0.0f;
-        putRGB(x, y, To8(SrgbEncode(r)), To8(SrgbEncode(g)), To8(SrgbEncode(b)));
+        putRGB(x, y, SrgbLut8(r), SrgbLut8(g), SrgbLut8(b));
       }
     }
     return;
   }
 
   // Scalar layer.
-  const std::string &compName = layer.comps.begin()->first;
-  const float *a = layer.comps.begin()->second;
-
+  const float *a = scalar;
   std::vector<float> finiteVals;
   finiteVals.reserve((size_t)w * (size_t)h);
   for (size_t idx = 0; idx < (size_t)w * (size_t)h; idx++) {
@@ -396,10 +481,9 @@ static void TonemapLayerToBGRX(const Layer &layer, const std::string &layerName,
     if (std::isfinite(v)) finiteVals.push_back(v);
   }
 
-  if (IsDepthLikeTonemap(layerName, compName)) {
-    std::sort(finiteVals.begin(), finiteVals.end());
-    float lo = PercentileSorted(finiteVals, 1.0);
-    float hi = PercentileSorted(finiteVals, 99.0);
+  if (depthLike) {
+    float lo = PercentileNth(finiteVals, 1.0);
+    float hi = PercentileNth(finiteVals, 99.0);
     float range = hi - lo;
     if (range < 1e-12f) range = 1e-12f;
     for (int y = 0; y < h; y++) {
@@ -408,8 +492,7 @@ static void TonemapLayerToBGRX(const Layer &layer, const std::string &layerName,
         float orig = a[idx];
         unsigned char g8;
         if (!std::isfinite(orig)) {
-          // Non-finite depth (e.g. Z = +Inf background) -> FAR/BLACK.
-          g8 = 0;
+          g8 = 0;  // non-finite depth (e.g. Z = +Inf background) -> FAR/BLACK
         } else {
           float n = Clamp01((orig - lo) / range);
           n = 1.0f - n;  // near = bright
@@ -426,8 +509,7 @@ static void TonemapLayerToBGRX(const Layer &layer, const std::string &layerName,
         size_t idx = (size_t)y * (size_t)w + (size_t)x;
         float v = Clean(a[idx]);
         float n = (mx > 1.0f) ? Clamp01(v / mx) : Clamp01(v);
-        n = SrgbEncode(n);
-        unsigned char g8 = To8(n);
+        unsigned char g8 = SrgbLut8(n);
         putRGB(x, y, g8, g8, g8);
       }
     }
@@ -435,164 +517,191 @@ static void TonemapLayerToBGRX(const Layer &layer, const std::string &layerName,
 }
 
 // ---------------------------------------------------------------------------
-// Decode an EXR file (all layers) into a DecodedFile. Unicode-safe (memory API).
-// Returns true on success; on failure writes a wide error into errOut.
+// Parse metadata only (no pixels): open the file over MemIStream, iterate all
+// parts + channels, build the ordered layer list. Returns false on failure.
 // ---------------------------------------------------------------------------
 
-static bool DecodeFile(const std::wstring &path, uint64_t mtime, DecodedFile &out,
-                       std::wstring &errOut) {
-  std::vector<unsigned char> bytes;
-  if (!ReadWholeFileW(path, bytes)) {
-    errOut = L"EXR: cannot open/read file";
-    return false;
-  }
-
-  EXRVersion version;
-  int ret = ParseEXRVersionFromMemory(&version, bytes.data(), bytes.size());
-  if (ret != 0) {
-    errOut = L"EXR: not a valid OpenEXR file";
-    return false;
-  }
-
-  // Multipart is not supported by our tinyexr path yet; signal the caller to
-  // delegate to the stock plugin by returning false.
-  if (version.multipart) {
-    errOut = L"EXR: multipart (delegating to stock plugin)";
-    return false;
-  }
-
-  const char *err = nullptr;
-  EXRHeader header;
-  EXRImage image;
-  InitEXRHeader(&header);
-  InitEXRImage(&image);
-
-  ret = ParseEXRHeaderFromMemory(&header, &version, bytes.data(), bytes.size(), &err);
-  if (ret != 0) {
-    errOut = L"EXR: failed to parse header";
-    if (err) FreeEXRErrorMessage(err);
-    return false;
-  }
-  for (int c = 0; c < header.num_channels; c++) {
-    if (header.pixel_types[c] == TINYEXR_PIXELTYPE_HALF)
-      header.requested_pixel_types[c] = TINYEXR_PIXELTYPE_FLOAT;
-    else
-      header.requested_pixel_types[c] = header.pixel_types[c];
-  }
-  ret = LoadEXRImageFromMemory(&image, &header, bytes.data(), bytes.size(), &err);
-  if (ret != 0) {
-    errOut = L"EXR: failed to load image";
-    if (err) FreeEXRErrorMessage(err);
-    FreeEXRHeader(&header);
-    return false;
-  }
-
-  // From here `image` and `header` are allocated and MUST be freed on every
-  // path. Wrap the heavy processing so a std::bad_alloc still frees them and
-  // degrades to a decode failure (the caller then falls back / returns NULL).
-  bool ok = true;
+static bool ParseMetadata(DecodedFile &df, std::wstring &errOut) {
   try {
-    if (image.images == nullptr) {
-      errOut = L"EXR: tiled images are not supported";  // -> fallback
-      ok = false;
-    }
+    MemIStream mis("exr", df.bytes.data(), df.bytes.size());
+    Imf::MultiPartInputFile mpf(mis, DecodeThreads());
+    int nparts = mpf.parts();
+    bool multi = nparts > 1;
 
-    int w = image.width;
-    int h = image.height;
+    for (int p = 0; p < nparts; p++) {
+      const Imf::Header &hdr = mpf.header(p);
 
-    if (ok && (w <= 0 || h <= 0)) {
-      errOut = L"EXR: invalid image dimensions";
-      ok = false;
-    }
-
-    if (ok) {
-      // Materialize per-channel float data (convert UINT to float in our code).
-      std::vector<std::vector<float>> convertedStorage;
-      // Reserve so pointers into convertedStorage stay valid.
-      convertedStorage.reserve(header.num_channels);
-      std::vector<const float *> channelData(header.num_channels);
-      for (int c = 0; c < header.num_channels; c++) {
-        if (header.pixel_types[c] == TINYEXR_PIXELTYPE_FLOAT) {
-          channelData[c] = reinterpret_cast<const float *>(image.images[c]);
-        } else if (header.pixel_types[c] == TINYEXR_PIXELTYPE_UINT) {
-          const uint32_t *up = reinterpret_cast<const uint32_t *>(image.images[c]);
-          std::vector<float> bufv((size_t)w * (size_t)h);
-          for (size_t idx = 0; idx < bufv.size(); idx++) bufv[idx] = (float)up[idx];
-          convertedStorage.push_back(std::move(bufv));
-          channelData[c] = convertedStorage.back().data();
-        } else {
-          std::vector<float> bufv((size_t)w * (size_t)h, 0.0f);
-          convertedStorage.push_back(std::move(bufv));
-          channelData[c] = convertedStorage.back().data();
-        }
+      // Skip deep parts (not supported by flat InputPart reads).
+      if (hdr.hasType()) {
+        const std::string &t = hdr.type();
+        if (t == "deepscanline" || t == "deeptile") continue;
       }
+
+      const Imath::Box2i dw = hdr.dataWindow();
+      const Imath::Box2i disp = hdr.displayWindow();
+      int w = dw.max.x - dw.min.x + 1;
+      int h = dw.max.y - dw.min.y + 1;
+      int dispW = disp.max.x - disp.min.x + 1;
+      int dispH = disp.max.y - disp.min.y + 1;
+      if (w <= 0 || h <= 0 || dispW <= 0 || dispH <= 0) continue;
+      int ox = dw.min.x - disp.min.x;  // data-window origin within display window
+      int oy = dw.min.y - disp.min.y;
+
+      std::string partName = hdr.hasName() ? hdr.name() : ("part" + std::to_string(p));
 
       // Group channels into layers (split on LAST '.').
-      std::map<std::string, Layer> layers;
-      for (int c = 0; c < header.num_channels; c++) {
-        std::string chName = header.channels[c].name;
-        std::string layerName, compName;
-        size_t dot = chName.rfind('.');
+      std::map<std::string, CompMap> layers;
+      const Imf::ChannelList &chans = hdr.channels();
+      for (Imf::ChannelList::ConstIterator it = chans.begin(); it != chans.end(); ++it) {
+        std::string full = it.name();
+        std::string ln, cn;
+        size_t dot = full.rfind('.');
         if (dot != std::string::npos) {
-          layerName = chName.substr(0, dot);
-          compName = chName.substr(dot + 1);
+          ln = full.substr(0, dot);
+          cn = full.substr(dot + 1);
         } else {
-          layerName = "";
-          compName = chName;
+          ln = "";
+          cn = full;
         }
-        Layer &layer = layers[layerName];
-        layer.name = layerName;
-        layer.comps[compName] = channelData[c];
+        layers[ln][cn] = full;
       }
 
-      // Order: beauty, then sorted others, then depth-like last.
-      std::vector<std::string> beautyBucket, normalBucket, depthBucket;
+      // Order within the part: beauty, sorted others, depth-like last.
+      std::vector<std::string> beautyB, normalB, depthB;
       for (auto &kv : layers) {
-        const std::string &name = kv.first;
-        if (name.empty()) beautyBucket.push_back(name);
-        else if (IsDepthLikeOrdering(name, kv.second)) depthBucket.push_back(name);
-        else normalBucket.push_back(name);
+        const std::string &ln = kv.first;
+        if (ln.empty()) beautyB.push_back(ln);
+        else if (IsDepthLikeOrdering(ln, kv.second)) depthB.push_back(ln);
+        else normalB.push_back(ln);
       }
-      SortCaseInsensitive(normalBucket);
-      SortCaseInsensitive(depthBucket);
+      SortCaseInsensitive(normalB);
+      SortCaseInsensitive(depthB);
+      std::vector<std::string> ordered;
+      ordered.insert(ordered.end(), beautyB.begin(), beautyB.end());
+      ordered.insert(ordered.end(), normalB.begin(), normalB.end());
+      ordered.insert(ordered.end(), depthB.begin(), depthB.end());
 
-      std::vector<std::string> orderedNames;
-      orderedNames.insert(orderedNames.end(), beautyBucket.begin(), beautyBucket.end());
-      orderedNames.insert(orderedNames.end(), normalBucket.begin(), normalBucket.end());
-      orderedNames.insert(orderedNames.end(), depthBucket.begin(), depthBucket.end());
-
-      out.path = path;
-      out.mtime = mtime;
-      out.width = w;
-      out.height = h;
-      out.names.clear();
-      out.layerPix.clear();
-      out.names.reserve(orderedNames.size());
-      out.layerPix.reserve(orderedNames.size());
-
-      for (const std::string &layerName : orderedNames) {
-        Layer &layer = layers[layerName];
-        std::vector<unsigned char> pix;
-        TonemapLayerToBGRX(layer, layerName, w, h, pix);
-        out.names.push_back(layerName);
-        out.layerPix.push_back(std::move(pix));
-      }
-
-      if (out.names.empty()) {
-        errOut = L"EXR: no layers found";
-        ok = false;
+      for (const std::string &ln : ordered) {
+        const CompMap &comps = layers[ln];
+        LayerDesc d;
+        d.part = p;
+        d.dispW = dispW;
+        d.dispH = dispH;
+        d.ox = ox;
+        d.oy = oy;
+        d.isColor = IsColorComps(comps);
+        if (d.isColor) {
+          d.rName = FindRole(comps, "r", "red");
+          d.gName = FindRole(comps, "g", "green");
+          d.bName = FindRole(comps, "b", "blue");
+        } else {
+          const std::string &cn = comps.begin()->first;
+          d.scalarName = comps.begin()->second;
+          d.depthLike = IsDepthLikeTonemap(ln, cn);
+        }
+        std::string base = ln.empty() ? "beauty" : ln;
+        d.display = multi ? (partName + "/" + base) : base;
+        df.layers.push_back(std::move(d));
       }
     }
+
+    if (df.layers.empty()) {
+      errOut = L"EXR: no displayable layers";
+      return false;
+    }
+    df.bgrx.assign(df.layers.size(), std::vector<unsigned char>());
+    return true;
+  } catch (const std::exception &) {
+    errOut = L"EXR: failed to parse header";
+    return false;
   } catch (...) {
-    errOut = L"EXR: out of memory while decoding";
-    ok = false;
+    errOut = L"EXR: failed to parse header";
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lazily decode + tone-map one layer into df.bgrx[idx] (heavy; call OUTSIDE the
+// lock). No-op if already cached. Returns false on failure.
+// ---------------------------------------------------------------------------
+
+// Mark `idx` most-recently-used and evict the least-recent decoded layers past
+// the cap (each BGRX buffer is ~w*h*4 bytes). Bounds memory on big multilayer
+// files. Called only from the (single) decode path.
+static void TouchLru(DecodedFile &df, int idx) {
+  const size_t kCap = 12;
+  auto &lru = df.lru;
+  for (auto it = lru.begin(); it != lru.end(); ++it) {
+    if (*it == idx) { lru.erase(it); break; }
+  }
+  lru.push_back(idx);
+  while (lru.size() > kCap) {
+    int victim = lru.front();
+    lru.erase(lru.begin());
+    if (victim != idx && victim >= 0 && victim < (int)df.bgrx.size()) {
+      df.bgrx[victim].clear();
+      df.bgrx[victim].shrink_to_fit();
+    }
+  }
+}
+
+static bool EnsureLayerDecoded(DecodedFile &df, int idx, std::wstring &errOut) {
+  if (idx < 0 || idx >= (int)df.layers.size()) {
+    errOut = L"EXR: bad layer index";
+    return false;
+  }
+  if (!df.bgrx[idx].empty()) {  // already decoded
+    TouchLru(df, idx);
+    return true;
   }
 
-  // Cleanup tinyexr allocations (always).
-  FreeEXRImage(&image);
-  FreeEXRHeader(&header);
+  const LayerDesc &L = df.layers[idx];
+  try {
+    MemIStream mis("exr", df.bytes.data(), df.bytes.size());
+    Imf::MultiPartInputFile mpf(mis, DecodeThreads());
+    Imf::InputPart part(mpf, L.part);
+    const Imf::Header &hdr = part.header();
+    const Imath::Box2i dw = hdr.dataWindow();
+    int w = dw.max.x - dw.min.x + 1;
+    int h = dw.max.y - dw.min.y + 1;
+    size_t npix = (size_t)w * (size_t)h;
+    int64_t originOff = (int64_t)dw.min.x + (int64_t)dw.min.y * (int64_t)w;
 
-  return ok;
+    std::vector<float> rbuf, gbuf, bbuf, sbuf;
+    Imf::FrameBuffer fb;
+    auto addSlice = [&](const std::string &chan, std::vector<float> &buf) -> const float * {
+      buf.assign(npix, 0.0f);
+      char *base = (char *)buf.data() - originOff * (int64_t)sizeof(float);
+      fb.insert(chan, Imf::Slice(Imf::FLOAT, base, sizeof(float),
+                                 sizeof(float) * (size_t)w));
+      return buf.data();
+    };
+
+    const float *rc = nullptr, *gc = nullptr, *bc = nullptr, *sc = nullptr;
+    if (L.isColor) {
+      if (!L.rName.empty()) rc = addSlice(L.rName, rbuf);
+      if (!L.gName.empty()) gc = addSlice(L.gName, gbuf);
+      if (!L.bName.empty()) bc = addSlice(L.bName, bbuf);
+    } else {
+      sc = addSlice(L.scalarName, sbuf);
+    }
+
+    part.setFrameBuffer(fb);
+    part.readPixels(dw.min.y, dw.max.y);
+
+    std::vector<unsigned char> out;
+    TonemapToBGRX(w, h, L.dispW, L.dispH, L.ox, L.oy, L.isColor, rc, gc, bc, sc,
+                  L.depthLike, out);
+    df.bgrx[idx] = std::move(out);
+    TouchLru(df, idx);
+    return true;
+  } catch (const std::exception &) {
+    errOut = L"EXR: failed to decode layer";
+    return false;
+  } catch (...) {
+    errOut = L"EXR: failed to decode layer";
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,11 +739,9 @@ static void DrawCaption(unsigned char *px, int w, int h, const std::string &text
   if (barW > w) barW = w;
   if (barH > h) barH = h;
 
-  // Dark background bar in the top-left (image coords y=0 is top).
   for (int y = 0; y < barH; y++)
     for (int x = 0; x < barW; x++) darkenPx(x, y);
 
-  // White glyphs.
   for (size_t i = 0; i < text.size(); i++) {
     unsigned char ch = (unsigned char)text[i];
     if (ch < 0x20 || ch > 0x7F) ch = '?';
@@ -655,15 +762,13 @@ static void DrawCaption(unsigned char *px, int w, int h, const std::string &text
 }
 
 // ---------------------------------------------------------------------------
-// Build the returned DIB (HGLOBAL) for a given layer index of a decoded file.
-// Reads only its arguments (no globals), so it needs no lock: the caller holds
-// a shared_ptr keeping `df` alive.
+// Build the returned DIB (HGLOBAL) from a layer's cached BGRX buffer.
 // ---------------------------------------------------------------------------
 
-static void *BuildDIB(const DecodedFile &df, int idx, int count) {
-  int w = df.width;
-  int h = df.height;
+static void *BuildDIB(const std::vector<unsigned char> &bgrx, int w, int h, int idx,
+                      int count, const std::string &displayName) {
   size_t pixBytes = (size_t)w * (size_t)h * 4u;
+  if (bgrx.size() < pixBytes) return nullptr;
   size_t total = 40 + pixBytes;
 
   HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, total);
@@ -685,16 +790,14 @@ static void *BuildDIB(const DecodedFile &df, int idx, int count) {
   memcpy(p, &bih, sizeof(bih));
 
   unsigned char *px = (unsigned char *)p + 40;
-  memcpy(px, df.layerPix[idx].data(), pixBytes);
+  memcpy(px, bgrx.data(), pixBytes);
 
-  // Caption "[i+1/count] name".
-  std::string layerName = DisplayName(df.names[idx]);
   char capbuf[512];
-  std::snprintf(capbuf, sizeof(capbuf), "[%d/%d] %s", idx + 1, count, layerName.c_str());
+  std::snprintf(capbuf, sizeof(capbuf), "[%d/%d] %s", idx + 1, count, displayName.c_str());
   DrawCaption(px, w, h, capbuf);
 
   GlobalUnlock(hg);
-  return hg;  // return the HGLOBAL handle (IrfanView takes ownership)
+  return hg;  // HGLOBAL handle; IrfanView takes ownership
 }
 
 // ---------------------------------------------------------------------------
@@ -710,7 +813,7 @@ static bool EndsWithExrCI(const std::wstring &p) {
 
 static void PostDropReload(HWND target, const std::wstring &path) {
   size_t pathChars = path.size() + 1;  // include terminating null
-  size_t total = sizeof(DROPFILES_LOCAL) + pathChars * sizeof(wchar_t) + sizeof(wchar_t);  // + extra null
+  size_t total = sizeof(DROPFILES_LOCAL) + pathChars * sizeof(wchar_t) + sizeof(wchar_t);
   HGLOBAL hg = GlobalAlloc(GHND, total);  // GHND = MOVEABLE | ZEROINIT
   if (!hg) return;
   DROPFILES_LOCAL *df = (DROPFILES_LOCAL *)GlobalLock(hg);
@@ -722,15 +825,12 @@ static void PostDropReload(HWND target, const std::wstring &path) {
   df->fWide = TRUE;
   wchar_t *dst = (wchar_t *)((unsigned char *)df + sizeof(DROPFILES_LOCAL));
   memcpy(dst, path.c_str(), pathChars * sizeof(wchar_t));
-  // Trailing double-null guaranteed by GHND zero-init.
   GlobalUnlock(hg);
   if (!PostMessageW(target, WM_DROPFILES, (WPARAM)hg, 0)) {
-    GlobalFree(hg);  // only free if the post failed (otherwise receiver owns it)
+    GlobalFree(hg);  // only free if the post failed (else receiver owns it)
   }
 }
 
-// Advance/retreat the layer index and re-drop the same path. Returns true if
-// the key was consumed.
 static bool HandleSwitch(int dir) {
   HWND fg = GetForegroundWindow();
   if (!fg) return false;
@@ -740,23 +840,35 @@ static bool HandleSwitch(int dir) {
 
   std::wstring path;
   bool act = false;
+  bool doPost = false;
   {
-    // Tiny locked region (RAII): just advance the index and read the path, so
-    // this never waits behind a decode (which now runs outside the lock).
+    // Tiny locked region (RAII): advance index + read path; never waits behind
+    // a decode (which runs outside the lock).
     CsGuard g(&g_cs);
     if (g_count > 1 && EndsWithExrCI(g_path)) {
       g_index = ((g_index + dir) % g_count + g_count) % g_count;
-      // Update the sticky target so the newly chosen pass persists across files.
       if (g_index >= 0 && g_index < (int)g_names.size())
-        g_currentLayerName = DisplayName(g_names[g_index]);
+        g_currentLayerName = g_names[g_index];
       path = g_path;
       act = true;
+      // Coalesce: only post a reload if none is already in flight. If one is
+      // pending, we still advanced g_index so the pending reload lands on the
+      // latest target -- no queue buildup on key auto-repeat / mashing.
+      // Auto-recovery: if the previous reload was posted long ago but never
+      // cleared (e.g. the WM_DROPFILES was lost because the window was
+      // minimized / lost focus), post again so switching can't stall forever.
+      ULONGLONG now = GetTickCount64();
+      if (!g_reloadPending || (now - g_reloadStamp > 800)) {
+        g_reloadPending = true;
+        g_reloadStamp = now;
+        doPost = true;
+      }
     }
   }
 
   if (!act) return false;
-  PostDropReload(fg, path);
-  return true;
+  if (doPost) PostDropReload(fg, path);
+  return true;  // swallow the key regardless (we handled it by advancing)
 }
 
 static LRESULT CALLBACK LowLevelKbdProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -792,10 +904,13 @@ static DWORD WINAPI HookThreadProc(LPVOID) {
 
 static void OneTimeInit() {
   if (InterlockedCompareExchange(&g_initOnce, 1, 0) != 0) return;
-  // Pin the DLL so it is never unloaded.
+  // Size OpenEXR's global worker pool so readPixels decompresses blocks in
+  // parallel (without this it runs single-threaded regardless of the count
+  // passed to MultiPartInputFile).
+  Imf::setGlobalThreadCount(DecodeThreads());
+  BuildSrgbLut();
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                      (LPCWSTR)&OneTimeInit, &g_hSelf);
-  // Start the hotkey hook thread.
   g_hookThread = CreateThread(nullptr, 0, HookThreadProc, nullptr, 0, nullptr);
 }
 
@@ -804,78 +919,25 @@ static void OneTimeInit() {
 // ---------------------------------------------------------------------------
 
 static void SafeWriteWide(wchar_t *dst, const wchar_t *src, int capGuess) {
-  // We do not know the caller's buffer size; write a short, bounded string.
   if (!dst) return;
   int i = 0;
   for (; src[i] && i < capGuess - 1; i++) dst[i] = src[i];
   dst[i] = 0;
 }
 
-// Delegate to the stock OpenEXR plugin (renamed EXR_original_backup.dll, sitting
-// next to our EXR.dll) for files tinyexr cannot handle (DWAA/DWAB, tiled,
-// multipart, corrupt). Loads the backup once, lazily. Returns the backup's
-// HGLOBAL (IrfanView owns it) or NULL. *backupAvail reports whether a usable
-// backup ReadEXR_W was found (so the caller knows whose error message to keep).
-static void *TryBackupFallback(const wchar_t *filename, void *a2, void *a3,
-                               wchar_t *statusText, wchar_t *formatText,
-                               int *widthOut, int *heightOut, bool *backupAvail) {
-  bool tried;
-  ReadEXRW_fn fn;
-  {
-    CsGuard g(&g_cs);
-    tried = g_backupTried;
-    fn = g_backupReadW;
-  }
-
-  if (!tried) {
-    // Resolve backup path from our own module and load it OUTSIDE the lock so
-    // the LL keyboard hook never blocks behind LoadLibrary.
-    HMODULE mod = nullptr;
-    ReadEXRW_fn resolved = nullptr;
-    wchar_t modpath[1024];
-    DWORD n = GetModuleFileNameW(g_hSelf, modpath, 1024);
-    if (n > 0 && n < 1024) {
-      std::wstring p(modpath);
-      size_t slash = p.find_last_of(L"\\/");
-      std::wstring dir = (slash == std::wstring::npos) ? std::wstring() : p.substr(0, slash + 1);
-      std::wstring backup = dir + L"EXR_original_backup.dll";
-      mod = LoadLibraryW(backup.c_str());
-      if (mod) resolved = (ReadEXRW_fn)GetProcAddress(mod, "ReadEXR_W");
-    }
-    {
-      CsGuard g(&g_cs);
-      if (!g_backupTried) {
-        g_backupTried = true;
-        g_backupMod = mod;
-        g_backupReadW = resolved;
-      } else if (mod && mod != g_backupMod) {
-        FreeLibrary(mod);  // lost a race; keep the first winner
-      }
-      fn = g_backupReadW;
-    }
-  }
-
-  if (backupAvail) *backupAvail = (fn != nullptr);
-  if (!fn) return nullptr;
-
-  void *r = fn(filename, a2, a3, statusText, formatText, widthOut, heightOut);
-  if (r) {
-    // Fallback file shows as a single "layer"; the hotkey won't try to cycle.
-    // Leave g_currentLayerName untouched so sticky selection survives across a
-    // fallback file back to the next scanline multilayer EXR.
-    CsGuard g(&g_cs);
-    g_path = filename ? filename : L"";
-    g_count = 1;
-    g_names.clear();
-  }
-  return r;
-}
-
-static void *ReadCore(const wchar_t *filename, void *a2, void *a3,
-                      wchar_t *statusText, wchar_t *formatText,
-                      int *widthOut, int *heightOut) {
+static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *statusText,
+                      wchar_t *formatText, int *widthOut, int *heightOut) {
+  (void)a2;
+  (void)a3;
   EnsureCsInit();
   OneTimeInit();
+
+  // A hotkey reload (if any) has now been delivered; clear the coalescing flag
+  // so the next Ctrl+Alt+arrow can post again.
+  {
+    CsGuard g(&g_cs);
+    g_reloadPending = false;
+  }
 
   if (!filename || !filename[0]) {
     SafeWriteWide(statusText, L"EXR: empty filename", 64);
@@ -886,97 +948,99 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3,
   uint64_t mtime = 0;
   GetFileMtime(path, mtime);  // best-effort; 0 if unavailable
 
-  // --- Tiny lock: cache lookup. Keep a shared_ptr so the data stays alive
-  //     while we build the DIB outside the lock. ---
+  // --- Tiny lock: cache lookup; keep a shared_ptr so data stays alive. ---
   std::shared_ptr<DecodedFile> local;
   {
     CsGuard g(&g_cs);
     if (g_cache && g_cache->path == path && g_cache->mtime == mtime &&
-        !g_cache->layerPix.empty()) {
+        !g_cache->layers.empty()) {
       local = g_cache;
     }
   }
 
-  // --- Decode OUTSIDE any lock on a cache miss. ---
+  // --- On a miss: read bytes + parse metadata OUTSIDE any lock. ---
   if (!local) {
     auto decoded = std::make_shared<DecodedFile>();
-    std::wstring errOut;
-    if (DecodeFile(path, mtime, *decoded, errOut)) {
-      CsGuard g(&g_cs);
-      if (g_cache && g_cache->path == path && g_cache->mtime == mtime &&
-          !g_cache->layerPix.empty()) {
-        local = g_cache;  // another thread already inserted it
-      } else {
-        g_cache = decoded;
-        local = decoded;
-      }
-    } else {
-      // tinyexr can't handle this file -> delegate to the stock plugin.
-      bool backupAvail = false;
-      void *fb = TryBackupFallback(filename, a2, a3, statusText, formatText,
-                                   widthOut, heightOut, &backupAvail);
-      if (fb) return fb;
-      if (backupAvail) return nullptr;  // backup ran and wrote its own status
-      SafeWriteWide(statusText, errOut.empty() ? L"EXR: decode failed" : errOut.c_str(), 96);
+    decoded->path = path;
+    decoded->mtime = mtime;
+    if (!ReadWholeFileW(path, decoded->bytes)) {
+      SafeWriteWide(statusText, L"EXR: cannot open/read file", 96);
       return nullptr;
+    }
+    std::wstring errOut;
+    if (!ParseMetadata(*decoded, errOut)) {
+      SafeWriteWide(statusText, errOut.empty() ? L"EXR: parse failed" : errOut.c_str(), 96);
+      return nullptr;
+    }
+    CsGuard g(&g_cs);
+    if (g_cache && g_cache->path == path && g_cache->mtime == mtime &&
+        !g_cache->layers.empty()) {
+      local = g_cache;  // another thread beat us
+    } else {
+      g_cache = decoded;
+      local = decoded;
     }
   }
 
-  // --- Layer selection (sticky by name / forced). Read the env var outside
-  //     the lock; the lock only touches the shared state. ---
+  // --- Layer selection (sticky by name / forced / beauty). ---
   wchar_t envbuf[32];
   DWORD en = GetEnvironmentVariableW(L"EXRLAYER_FORCE_INDEX", envbuf, 32);
   bool forced = (en > 0 && en < 32);
   int forcedIdx = forced ? _wtoi(envbuf) : 0;
 
-  int count = (int)local->names.size();
+  int count = (int)local->layers.size();
   int idx = 0;
   {
     CsGuard g(&g_cs);
     g_path = path;
     g_count = count;
-    g_names = local->names;
+    g_names.clear();
+    g_names.reserve(count);
+    for (const LayerDesc &L : local->layers) g_names.push_back(L.display);
+
     if (forced) {
-      // 1) Forced index (test hook): use it AND update the sticky target.
       if (forcedIdx < 0) forcedIdx = 0;
       if (forcedIdx >= count) forcedIdx = count - 1;
       g_index = forcedIdx;
-      g_currentLayerName = DisplayName(g_names[g_index]);
+      g_currentLayerName = g_names[g_index];
     } else if (!g_currentLayerName.empty()) {
-      // 2) Sticky: if a layer with the same display name exists here, show it;
-      //    otherwise fall back to beauty (index 0).
       int found = -1;
       for (int i = 0; i < count; i++) {
-        if (DisplayName(g_names[i]) == g_currentLayerName) { found = i; break; }
+        if (g_names[i] == g_currentLayerName) { found = i; break; }
       }
       if (found >= 0) {
         g_index = found;
       } else {
         g_index = 0;
-        g_currentLayerName = DisplayName(g_names[0]);
+        g_currentLayerName = g_names[0];
       }
     } else {
-      // 3) First-ever call: beauty.
       g_index = 0;
-      g_currentLayerName = DisplayName(g_names[0]);
+      g_currentLayerName = g_names[0];
     }
     idx = g_index;
   }
 
-  // --- Build the DIB OUTSIDE the lock (memcpy + caption) from the shared_ptr. ---
-  void *dib = BuildDIB(*local, idx, count);
+  // --- Heavy: lazily decode the selected layer OUTSIDE the lock. ---
+  std::wstring derr;
+  if (!EnsureLayerDecoded(*local, idx, derr)) {
+    SafeWriteWide(statusText, derr.empty() ? L"EXR: decode failed" : derr.c_str(), 96);
+    return nullptr;
+  }
+
+  const LayerDesc &L = local->layers[idx];
+  void *dib = BuildDIB(local->bgrx[idx], L.dispW, L.dispH, idx, count, L.display);
   if (!dib) {
     SafeWriteWide(statusText, L"EXR: out of memory", 64);
     return nullptr;
   }
 
-  if (widthOut) *widthOut = local->width;
-  if (heightOut) *heightOut = local->height;
-
+  if (widthOut) *widthOut = L.dispW;
+  if (heightOut) *heightOut = L.dispH;
   if (formatText) {
-    wchar_t fbuf[64];
-    std::swprintf(fbuf, 64, L"EXR - layer %d/%d", idx + 1, count);
-    SafeWriteWide(formatText, fbuf, 64);
+    wchar_t fbuf[96];
+    std::swprintf(fbuf, 96, L"EXR %hs [layer %d/%d]", L.display.c_str(), idx + 1, count);
+    SafeWriteWide(formatText, fbuf, 96);
   }
 
   return dib;
@@ -992,10 +1056,8 @@ extern "C" int GetPlugInInfo(char *version, char *formats) {
   return 0;
 }
 
-extern "C" void *ReadEXR_W(const wchar_t *filename, void *a2, void *a3,
-                           wchar_t *statusText, wchar_t *formatText,
-                           int *widthOut, int *heightOut) {
-  // Exception boundary: nothing may propagate out of the DLL into IrfanView.
+extern "C" void *ReadEXR_W(const wchar_t *filename, void *a2, void *a3, wchar_t *statusText,
+                           wchar_t *formatText, int *widthOut, int *heightOut) {
   try {
     return ReadCore(filename, a2, a3, statusText, formatText, widthOut, heightOut);
   } catch (...) {
@@ -1004,10 +1066,8 @@ extern "C" void *ReadEXR_W(const wchar_t *filename, void *a2, void *a3,
   }
 }
 
-extern "C" void *ReadEXR(const char *filename, void *a2, void *a3,
-                         wchar_t *statusText, wchar_t *formatText,
-                         int *widthOut, int *heightOut) {
-  // Exception boundary: nothing may propagate out of the DLL into IrfanView.
+extern "C" void *ReadEXR(const char *filename, void *a2, void *a3, wchar_t *statusText,
+                         wchar_t *formatText, int *widthOut, int *heightOut) {
   try {
     std::wstring wide;
     if (filename && filename[0]) {
@@ -1030,7 +1090,6 @@ extern "C" void *ReadEXR(const char *filename, void *a2, void *a3,
 // ---------------------------------------------------------------------------
 
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
-  (void)hInst;
   (void)reserved;
   switch (reason) {
     case DLL_PROCESS_ATTACH:

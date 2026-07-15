@@ -1050,7 +1050,14 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *stat
 // Exported entry points
 // ---------------------------------------------------------------------------
 
+// Marker string so the installer can recognize a previously-installed copy of
+// THIS plugin (vs the genuine stock EXR.dll) and never back ours up as "stock".
+// Exported + referenced so the linker keeps it in the binary.
+extern "C" __declspec(dllexport) const char EXRViewerPluginTag[] =
+    "IrfanView_EXR_Layer_Plugin_MARKER_kaki373";
+
 extern "C" int GetPlugInInfo(char *version, char *formats) {
+  (void)EXRViewerPluginTag;  // keep the marker referenced
   if (version) strcpy(version, "1.0");
   if (formats) strcpy(formats, "EXR Format - EXR");
   return 0;

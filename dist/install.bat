@@ -22,8 +22,8 @@ set "IVDIR=%ProgramFiles%\IrfanView"
 if not exist "%IVDIR%\i_view64.exe" (
   echo.
   echo [!] 64-bit IrfanView not found at "%IVDIR%".
-  echo     This plugin is 64-bit only. If IrfanView is installed elsewhere,
-  echo     copy EXR.dll manually into its \Plugins folder (see README.txt).
+  echo     If IrfanView is installed elsewhere, copy EXR.dll into its
+  echo     \Plugins folder manually (see README.txt).
   echo.
   pause
   exit /b 1
@@ -31,20 +31,34 @@ if not exist "%IVDIR%\i_view64.exe" (
 
 set "PLUG=%IVDIR%\Plugins"
 if not exist "%PLUG%" mkdir "%PLUG%"
+set "EXR=%PLUG%\EXR.dll"
+set "BACKUP=%PLUG%\EXR_original_backup.dll"
+set "MARKER=IrfanView_EXR_Layer_Plugin_MARKER_kaki373"
 
-REM --- back up the stock EXR.dll ONCE (keep the true original) ---
-if exist "%PLUG%\EXR.dll" (
-  if not exist "%PLUG%\EXR_original_backup.dll" (
-    ren "%PLUG%\EXR.dll" "EXR_original_backup.dll"
-    echo Backed up stock EXR.dll  -^>  EXR_original_backup.dll
-  ) else (
-    echo Existing backup found; leaving it intact.
-    del /q "%PLUG%\EXR.dll" 2>nul
-  )
+if not exist "%EXR%" goto :install
+
+if exist "%BACKUP%" (
+  REM A stock backup already exists from a prior install -> keep it, just
+  REM replace whatever EXR.dll is there now (old stock backup stays intact).
+  echo Updating over an existing install; keeping the existing stock backup.
+  del /q "%EXR%"
+  goto :install
 )
 
-REM --- install the custom plugin ---
-copy /y "%~dp0EXR.dll" "%PLUG%\EXR.dll" >nul
+REM No backup yet: is the current EXR.dll a previous copy of THIS plugin, or
+REM the genuine stock IrfanView plugin? Only the genuine stock gets backed up.
+findstr /m /c:"%MARKER%" "%EXR%" >nul 2>&1
+if %errorlevel%==0 (
+  echo Existing EXR.dll is a previous copy of this plugin; replacing it.
+  echo   ^(No genuine stock backup was present - nothing to preserve.^)
+  del /q "%EXR%"
+) else (
+  ren "%EXR%" "EXR_original_backup.dll"
+  echo Backed up the stock EXR.dll  -^>  EXR_original_backup.dll
+)
+
+:install
+copy /y "%~dp0EXR.dll" "%EXR%" >nul
 if errorlevel 1 (
   echo [!] Copy failed. Is IrfanView still open? Close it and re-run.
   pause
@@ -52,12 +66,10 @@ if errorlevel 1 (
 )
 
 echo.
-echo Installed:  %PLUG%\EXR.dll
-echo Backup:     %PLUG%\EXR_original_backup.dll  (do NOT delete - used as fallback)
+echo Installed:  %EXR%
+if exist "%BACKUP%" echo Backup:     %BACKUP%  ^(kept for uninstall^)
 echo.
 echo DONE. Open an .exr in IrfanView, then:
 echo    Ctrl+Alt+Right / Left  = next / previous layer (same window)
-echo    switch to e.g. depth, then use IrfanView's next-image key to
-echo    browse a sequence staying on that layer.
 echo.
 pause

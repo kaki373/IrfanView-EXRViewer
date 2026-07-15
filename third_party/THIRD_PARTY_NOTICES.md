@@ -20,6 +20,17 @@ each remains under its own license.
 - License: MIT
 - Vendored inside OpenEXR 3.x for ZIP (de)compression.
 
+## ACES (baked LUT in `src/aces_lut.h`)
+- `src/aces_lut.h` is a 33³ 3D LUT of the **ACES 2.0 SDR sRGB output transform**
+  (ACEScg input), generated with OpenColorIO from the built-in config
+  `cg-config-v4.0.0_aces-v2.0_ocio-v2.5`.
+- ACES ("Academy Color Encoding System") is a project of the Academy of Motion
+  Picture Arts and Sciences (A.M.P.A.S.). The ACES transforms and reference
+  implementation are under the ACES license (Academy) — https://acescentral.com
+  and https://github.com/AcademySoftwareFoundation/OpenColorIO-Config-ACES .
+- OpenColorIO (used only to generate the LUT, not linked into the DLL): BSD
+  3-Clause, https://opencolorio.org .
+
 The 8x8 bitmap font used for the on-image caption is `font8x8_basic` (public
 domain, by Daniel Hepper), embedded directly in `src/exrplugin.cpp`.
 

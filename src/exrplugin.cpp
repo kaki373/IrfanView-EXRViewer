@@ -64,6 +64,9 @@ typedef struct _DROPFILES_LOCAL {
 #include <ImathBox.h>
 #include <Iex.h>
 
+// Baked ACES 2.0 SDR sRGB output transform (ACEScg/AP1 input) as a 33^3 3D LUT.
+#include "aces_lut.h"
+
 // ---------------------------------------------------------------------------
 // 8x8 bitmap font (public domain "font8x8_basic", dhepper) for ASCII 0x20-0x7F.
 // Each glyph is 8 bytes (one per row); bit 0 (LSB) is the leftmost pixel.
@@ -241,6 +244,66 @@ static inline unsigned char SrgbLut8(float x) {
   return g_srgbLut[idx];
 }
 
+// ---------------------------------------------------------------------------
+// ACES 2.0 SDR sRGB output transform via the baked 33^3 3D LUT (aces_lut.h).
+// Input is ACEScg (AP1) linear; output is final 8-bit sRGB.
+// ---------------------------------------------------------------------------
+
+// Per-channel log2 shaper -> normalized [0,1] grid coordinate.
+static inline float AcesShape(float x) {
+  x = Clean(x);  // NaN/Inf -> 0
+  const float lo = exp2f(kAcesLutMin);
+  const float hi = exp2f(kAcesLutMax);
+  if (x < lo) x = lo;
+  if (x > hi) x = hi;
+  float n = (log2f(x) - kAcesLutMin) / (kAcesLutMax - kAcesLutMin);
+  return Clamp01(n);
+}
+
+// Tetrahedral lookup of an ACEScg triplet, producing 8-bit sRGB output.
+static void AcesLut8(float r, float g, float b, unsigned char &oR, unsigned char &oG,
+                     unsigned char &oB) {
+  const int N = kAcesLutN;
+  float pr = AcesShape(r) * (float)(N - 1);
+  float pg = AcesShape(g) * (float)(N - 1);
+  float pb = AcesShape(b) * (float)(N - 1);
+
+  int i0r = (int)floorf(pr), i0g = (int)floorf(pg), i0b = (int)floorf(pb);
+  if (i0r < 0) i0r = 0; if (i0r > N - 2) i0r = N - 2;
+  if (i0g < 0) i0g = 0; if (i0g > N - 2) i0g = N - 2;
+  if (i0b < 0) i0b = 0; if (i0b > N - 2) i0b = N - 2;
+  float fr = pr - (float)i0r, fg = pg - (float)i0g, fb = pb - (float)i0b;
+
+  // Corner base offsets in the flat LUT (index = ((r*N+g)*N+b)*3 + ch).
+  const size_t sR = (size_t)N * N * 3, sG = (size_t)N * 3, sB = 3;
+  const size_t base = (((size_t)i0r * N + i0g) * N + i0b) * 3;
+  const size_t o000 = base, o100 = base + sR, o010 = base + sG, o001 = base + sB;
+  const size_t o110 = base + sR + sG, o101 = base + sR + sB, o011 = base + sG + sB;
+  const size_t o111 = base + sR + sG + sB;
+
+  unsigned char *out[3] = {&oR, &oG, &oB};
+  for (int ch = 0; ch < 3; ch++) {
+    float C000 = kAcesLut[o000 + ch], C100 = kAcesLut[o100 + ch];
+    float C010 = kAcesLut[o010 + ch], C001 = kAcesLut[o001 + ch];
+    float C110 = kAcesLut[o110 + ch], C101 = kAcesLut[o101 + ch];
+    float C011 = kAcesLut[o011 + ch], C111 = kAcesLut[o111 + ch];
+    float o;
+    if (fr > fg) {
+      if (fg > fb)      o = C000 + fr * (C100 - C000) + fg * (C110 - C100) + fb * (C111 - C110);
+      else if (fr > fb) o = C000 + fr * (C100 - C000) + fb * (C101 - C100) + fg * (C111 - C101);
+      else              o = C000 + fb * (C001 - C000) + fr * (C101 - C001) + fg * (C111 - C101);
+    } else {
+      if (fb > fg)      o = C000 + fb * (C001 - C000) + fg * (C011 - C001) + fr * (C111 - C011);
+      else if (fb > fr) o = C000 + fg * (C010 - C000) + fb * (C011 - C010) + fr * (C111 - C011);
+      else              o = C000 + fg * (C010 - C000) + fr * (C110 - C010) + fb * (C111 - C110);
+    }
+    int iv = (int)(o + 0.5f);
+    if (iv < 0) iv = 0;
+    if (iv > 255) iv = 255;
+    *out[ch] = (unsigned char)iv;
+  }
+}
+
 static void SortCaseInsensitive(std::vector<std::string> &v) {
   std::sort(v.begin(), v.end(), [](const std::string &a, const std::string &b) {
     return ToLowerAscii(a) < ToLowerAscii(b);
@@ -311,6 +374,7 @@ struct DecodedFile {
   std::vector<LayerDesc> layers;                       // ordered
   std::vector<std::vector<unsigned char>> bgrx;        // per-layer tone-mapped BGRX (lazy)
   std::vector<int> lru;                                // decoded indices, oldest..newest
+  bool acesMode = true;                                // color mode the cached BGRX was built with
 };
 
 // ---------------------------------------------------------------------------
@@ -327,6 +391,7 @@ static std::string g_currentLayerName;         // sticky selection (display name
 static std::shared_ptr<DecodedFile> g_cache;   // single cache slot, guarded by g_cs
 static bool g_reloadPending = false;           // one hotkey reload in flight at a time
 static ULONGLONG g_reloadStamp = 0;            // tick of last posted reload (stall recovery)
+static bool g_acesView = true;                 // color view transform: true=ACES 2.0, false=sRGB
 
 static HMODULE g_hSelf = nullptr;
 static LONG g_initOnce = 0;
@@ -444,7 +509,7 @@ class MemIStream : public Imf::IStream {
 // ox==oy==0 this is byte-identical to filling a data-sized buffer.
 static void TonemapToBGRX(int w, int h, int dispW, int dispH, int ox, int oy, bool isColor,
                           const float *rc, const float *gc, const float *bc,
-                          const float *scalar, bool depthLike,
+                          const float *scalar, bool depthLike, bool aces,
                           std::vector<unsigned char> &buf) {
   buf.assign((size_t)dispW * (size_t)dispH * 4u, 0);  // zero => black margins
 
@@ -466,7 +531,13 @@ static void TonemapToBGRX(int w, int h, int dispW, int dispH, int ox, int oy, bo
         float r = rc ? Clean(rc[idx]) : 0.0f;
         float g = gc ? Clean(gc[idx]) : 0.0f;
         float b = bc ? Clean(bc[idx]) : 0.0f;
-        putRGB(x, y, SrgbLut8(r), SrgbLut8(g), SrgbLut8(b));
+        if (aces) {
+          unsigned char R, G, B;
+          AcesLut8(r, g, b, R, G, B);  // ACEScg(AP1) -> ACES 2.0 SDR sRGB
+          putRGB(x, y, R, G, B);
+        } else {
+          putRGB(x, y, SrgbLut8(r), SrgbLut8(g), SrgbLut8(b));  // plain linear->sRGB
+        }
       }
     }
     return;
@@ -691,7 +762,7 @@ static bool EnsureLayerDecoded(DecodedFile &df, int idx, std::wstring &errOut) {
 
     std::vector<unsigned char> out;
     TonemapToBGRX(w, h, L.dispW, L.dispH, L.ox, L.oy, L.isColor, rc, gc, bc, sc,
-                  L.depthLike, out);
+                  L.depthLike, df.acesMode, out);
     df.bgrx[idx] = std::move(out);
     TouchLru(df, idx);
     return true;
@@ -766,7 +837,7 @@ static void DrawCaption(unsigned char *px, int w, int h, const std::string &text
 // ---------------------------------------------------------------------------
 
 static void *BuildDIB(const std::vector<unsigned char> &bgrx, int w, int h, int idx,
-                      int count, const std::string &displayName) {
+                      int count, const std::string &displayName, bool isColor, bool aces) {
   size_t pixBytes = (size_t)w * (size_t)h * 4u;
   if (bgrx.size() < pixBytes) return nullptr;
   size_t total = 40 + pixBytes;
@@ -793,7 +864,12 @@ static void *BuildDIB(const std::vector<unsigned char> &bgrx, int w, int h, int 
   memcpy(px, bgrx.data(), pixBytes);
 
   char capbuf[512];
-  std::snprintf(capbuf, sizeof(capbuf), "[%d/%d] %s", idx + 1, count, displayName.c_str());
+  if (isColor) {
+    std::snprintf(capbuf, sizeof(capbuf), "[%d/%d] %s  %s", idx + 1, count,
+                  displayName.c_str(), aces ? "ACES" : "sRGB");
+  } else {
+    std::snprintf(capbuf, sizeof(capbuf), "[%d/%d] %s", idx + 1, count, displayName.c_str());
+  }
   DrawCaption(px, w, h, capbuf);
 
   GlobalUnlock(hg);
@@ -871,19 +947,55 @@ static bool HandleSwitch(int dir) {
   return true;  // swallow the key regardless (we handled it by advancing)
 }
 
+// Flip the ACES/sRGB view transform and reload the current file so color layers
+// re-render in the new mode. Reuses the reload-coalescing logic; the cached
+// pixels are invalidated on the main thread in ReadCore (mode-mismatch), so we
+// never touch the decode-owned BGRX buffers from the hook thread.
+static bool HandleAcesToggle() {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(fg, &pid);
+  if (pid != GetCurrentProcessId()) return false;
+
+  std::wstring path;
+  bool act = false;
+  bool doPost = false;
+  {
+    CsGuard g(&g_cs);
+    if (!g_path.empty() && EndsWithExrCI(g_path)) {
+      g_acesView = !g_acesView;
+      path = g_path;
+      act = true;
+      ULONGLONG now = GetTickCount64();
+      if (!g_reloadPending || (now - g_reloadStamp > 800)) {
+        g_reloadPending = true;
+        g_reloadStamp = now;
+        doPost = true;
+      }
+    }
+  }
+
+  if (!act) return false;
+  if (doPost) PostDropReload(fg, path);
+  return true;  // swallow the key
+}
+
 static LRESULT CALLBACK LowLevelKbdProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
     const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lParam;
-    if (k->vkCode == VK_RIGHT || k->vkCode == VK_LEFT) {
-      bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-      bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-      if (ctrl && alt) {
-        int dir = (k->vkCode == VK_RIGHT) ? +1 : -1;
-        try {
+    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    if (ctrl && alt) {
+      try {
+        if (k->vkCode == VK_RIGHT || k->vkCode == VK_LEFT) {
+          int dir = (k->vkCode == VK_RIGHT) ? +1 : -1;
           if (HandleSwitch(dir)) return 1;  // swallow the key
-        } catch (...) {
-          // Never let an exception escape the hook callback.
+        } else if (k->vkCode == 'A') {
+          if (HandleAcesToggle()) return 1;  // swallow the key
         }
+      } catch (...) {
+        // Never let an exception escape the hook callback.
       }
     }
   }
@@ -948,6 +1060,17 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *stat
   uint64_t mtime = 0;
   GetFileMtime(path, mtime);  // best-effort; 0 if unavailable
 
+  // --- Effective color view transform: persistent g_acesView, overridable per
+  //     call by env EXRLAYER_FORCE_ACES ("0"/"1") for deterministic tests. ---
+  bool effAces;
+  {
+    CsGuard g(&g_cs);
+    effAces = g_acesView;
+  }
+  wchar_t acesEnv[8];
+  DWORD aen = GetEnvironmentVariableW(L"EXRLAYER_FORCE_ACES", acesEnv, 8);
+  if (aen > 0 && aen < 8) effAces = (_wtoi(acesEnv) != 0);
+
   // --- Tiny lock: cache lookup; keep a shared_ptr so data stays alive. ---
   std::shared_ptr<DecodedFile> local;
   {
@@ -963,6 +1086,7 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *stat
     auto decoded = std::make_shared<DecodedFile>();
     decoded->path = path;
     decoded->mtime = mtime;
+    decoded->acesMode = effAces;  // first decode uses the effective mode
     if (!ReadWholeFileW(path, decoded->bytes)) {
       SafeWriteWide(statusText, L"EXR: cannot open/read file", 96);
       return nullptr;
@@ -1021,6 +1145,18 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *stat
     idx = g_index;
   }
 
+  // --- Color-mode reconcile: if the effective view transform differs from the
+  //     mode the cached pixels were tone-mapped with, drop them so they rebuild
+  //     in the new mode (done on this thread, so it can't race the decode). ---
+  if (local->acesMode != effAces) {
+    for (auto &b : local->bgrx) {
+      b.clear();
+      b.shrink_to_fit();
+    }
+    local->lru.clear();
+    local->acesMode = effAces;
+  }
+
   // --- Heavy: lazily decode the selected layer OUTSIDE the lock. ---
   std::wstring derr;
   if (!EnsureLayerDecoded(*local, idx, derr)) {
@@ -1029,7 +1165,8 @@ static void *ReadCore(const wchar_t *filename, void *a2, void *a3, wchar_t *stat
   }
 
   const LayerDesc &L = local->layers[idx];
-  void *dib = BuildDIB(local->bgrx[idx], L.dispW, L.dispH, idx, count, L.display);
+  void *dib = BuildDIB(local->bgrx[idx], L.dispW, L.dispH, idx, count, L.display,
+                       L.isColor, local->acesMode);
   if (!dib) {
     SafeWriteWide(statusText, L"EXR: out of memory", 64);
     return nullptr;

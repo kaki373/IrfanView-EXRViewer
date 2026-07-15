@@ -20,6 +20,10 @@ in-place, inside the same IrfanView window**, with a hotkey.
 - **Real OpenEXR under the hood** — decodes **all** compressions including
   **DWAA/DWAB**, plus **tiled**, **multipart**, and UINT channels. (Statically
   links OpenEXR 3.3, so there are no extra runtime DLLs.)
+- **ACES 2.0 view transform** — color layers can be shown through the **ACES 2.0
+  SDR sRGB output transform** (input assumed ACEScg / AP1), baked into an
+  embedded 3D LUT, instead of a plain linear→sRGB. Toggle it with `Ctrl+Alt+A`;
+  the caption shows the active mode (`ACES` or `sRGB`). Default is ACES on.
 - **Fast** — lazy per-layer decode with a tone-mapped cache: a large 160 MB /
   20-layer DWAA file opens in ~0.4 s and each new layer appears in ~0.3–0.4 s
   (re-viewing a cached layer is instant). Uses OpenEXR's multithreaded decode.
@@ -52,8 +56,10 @@ Uninstall: `dist/uninstall.bat` (restores the stock DLL).
 
 ## Usage
 
-- Open an `.exr` → beauty layer with a `[1/N] beauty` caption.
+- Open an `.exr` → beauty layer with a `[1/N] beauty  ACES` caption.
 - `Ctrl+Alt+Right` / `Ctrl+Alt+Left` → next / previous layer (same window).
+- `Ctrl+Alt+A` → toggle the color view between **ACES 2.0** and plain **sRGB**
+  (the caption shows the active mode).
 - Switch to a pass, then press IrfanView's *next image* key to browse a
   sequence while staying on that pass.
 
@@ -73,8 +79,11 @@ dependency).
 ## Limitations
 
 - 64-bit IrfanView only (the DLL is x64).
-- The tone-map is fixed: color passes use linear→sRGB; depth-like passes are
-  percentile-normalized (near = bright, non-finite/Inf background = black).
+- Color passes render via ACES 2.0 (assuming ACEScg/AP1 input) or plain
+  linear→sRGB (`Ctrl+Alt+A` toggle); the ACES path is a baked 33³ 3D LUT and is
+  ~0.2 s/layer slower than sRGB. Depth-like passes are percentile-normalized
+  (near = bright, non-finite/Inf background = black) and are not color-managed.
+  The `chromaticities` attribute is not yet honored (ACEScg input is assumed).
 - First view of a layer costs a near-full decompress (EXR compresses all
   channels per block); re-viewing is instant. The per-layer BGRX cache is
   bounded to the 12 most-recently-viewed layers.

@@ -964,11 +964,13 @@ static bool HandleAcesToggle() {
   {
     CsGuard g(&g_cs);
     if (!g_path.empty() && EndsWithExrCI(g_path)) {
-      g_acesView = !g_acesView;
-      path = g_path;
-      act = true;
+      act = true;  // swallow the key regardless of coalescing
       ULONGLONG now = GetTickCount64();
       if (!g_reloadPending || (now - g_reloadStamp > 800)) {
+        // Flip only when we actually post a reload, so holding Ctrl+Alt+A
+        // (auto-repeat) doesn't ping-pong the mode on every key-down.
+        g_acesView = !g_acesView;
+        path = g_path;
         g_reloadPending = true;
         g_reloadStamp = now;
         doPost = true;

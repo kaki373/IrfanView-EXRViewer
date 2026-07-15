@@ -80,10 +80,13 @@ dependency).
 
 - 64-bit IrfanView only (the DLL is x64).
 - Color passes render via ACES 2.0 (assuming ACEScg/AP1 input) or plain
-  linear→sRGB (`Ctrl+Alt+A` toggle); the ACES path is a baked 33³ 3D LUT and is
+  linear→sRGB (`Ctrl+Alt+A` toggle); the ACES path is a baked 65³ 3D LUT
+  (matches the OCIO reference within ~0.5/255 mean on real renders) and is
   ~0.2 s/layer slower than sRGB. Depth-like passes are percentile-normalized
   (near = bright, non-finite/Inf background = black) and are not color-managed.
-  The `chromaticities` attribute is not yet honored (ACEScg input is assumed).
+  The `chromaticities` attribute is not yet honored (ACEScg input is assumed),
+  so the plain-sRGB mode of an ACEScg file skips the AP1→Rec.709 conversion
+  (it is a raw linear→sRGB view, slightly over-saturated).
 - First view of a layer costs a near-full decompress (EXR compresses all
   channels per block); re-viewing is instant. The per-layer BGRX cache is
   bounded to the 12 most-recently-viewed layers.

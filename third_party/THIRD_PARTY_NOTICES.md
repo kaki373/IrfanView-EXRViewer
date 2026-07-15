@@ -21,7 +21,7 @@ each remains under its own license.
 - Vendored inside OpenEXR 3.x for ZIP (de)compression.
 
 ## ACES (baked LUT in `src/aces_lut.h`)
-- `src/aces_lut.h` is a 33³ 3D LUT of the **ACES 2.0 SDR sRGB output transform**
+- `src/aces_lut.h` is a 65³ 3D LUT of the **ACES 2.0 SDR sRGB output transform**
   (ACEScg input), generated with OpenColorIO from the built-in config
   `cg-config-v4.0.0_aces-v2.0_ocio-v2.5`.
 - ACES ("Academy Color Encoding System") is a project of the Academy of Motion
